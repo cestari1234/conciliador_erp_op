@@ -221,6 +221,7 @@ if file_erp and file_operadora:
             with col_opt1:
                 check_erp_filter = st.checkbox("Filtrar Vendas Parceladas (Apenas Parcelas = 1)", value=True)
                 check_date_fmt = st.checkbox("Padronizar formato de datas (DD/MM/AAAA)", value=True)
+                check_debits = st.checkbox("Separar débitos (- R$)", value=True)
             with col_opt2:
                 check_op_agg = st.checkbox("Unificar Vendas por NSU (Somar Valores)", value=True)
                 check_val_fmt = st.checkbox("Padronizar formato de valores (R$ 0.00)", value=True)
@@ -260,7 +261,36 @@ if file_erp and file_operadora:
                             df_erp_std['parcelas'] = df_erp_std['parcelas'].astype(str).str.replace(r'\.0$', '', regex=True)
                             df_erp_std = df_erp_std[df_erp_std['parcelas'] == '1']
 
-                    # 2. Operadora: Unificar por NSU (Somar Valor)
+                    # 2. Separar Débitos (Valores Negativos)
+                    df_debits_final = pd.DataFrame()
+                    if check_debits:
+                        # Converter para numérico para filtrar
+                        df_erp_std['valor_venda_temp'] = pd.to_numeric(df_erp_std['valor_venda'], errors='coerce').fillna(0)
+                        df_op_std['valor_venda_temp'] = pd.to_numeric(df_op_std['valor_venda'], errors='coerce').fillna(0)
+
+                        # Filtrar Débitos
+                        df_erp_debits = df_erp_std[df_erp_std['valor_venda_temp'] < 0].copy()
+                        df_op_debits = df_op_std[df_op_std['valor_venda_temp'] < 0].copy()
+
+                        # Adicionar coluna Origem
+                        df_erp_debits['Origem'] = 'ERP'
+                        df_op_debits['Origem'] = 'Operadora'
+
+                        # Concatenar
+                        df_debits_final = pd.concat([df_erp_debits, df_op_debits], ignore_index=True)
+                        
+                        # Remover colunas temporárias e desnecessárias dos débitos
+                        if 'valor_venda_temp' in df_debits_final.columns:
+                            df_debits_final = df_debits_final.drop(columns=['valor_venda_temp'])
+
+                        # Remover Débitos dos DataFrames principais
+                        df_erp_std = df_erp_std[df_erp_std['valor_venda_temp'] >= 0].drop(columns=['valor_venda_temp'])
+                        df_op_std = df_op_std[df_op_std['valor_venda_temp'] >= 0].drop(columns=['valor_venda_temp'])
+                    
+                    # Salvar Débitos no Session State
+                    st.session_state.df_debits = df_debits_final
+
+                    # 3. Operadora: Unificar por NSU (Somar Valor)
                     df_op_std['valor_venda'] = pd.to_numeric(df_op_std['valor_venda'], errors='coerce').fillna(0)
                     
                     if check_op_agg:
@@ -406,15 +436,45 @@ if file_erp and file_operadora:
             # Remover colunas auxiliares
             df_merged = df_merged.drop(columns=['match_id', '_merge'])
 
-            # Exibir Métricas
+            # Métricas ERP
             total_vendas = len(df_merged)
             total_conciliado = len(df_merged[df_merged['status_conciliacao'] == 'CONCILIADO'])
             total_divergente = len(df_merged[df_merged['status_conciliacao'] == 'DIVERGENTE'])
-            
+
+            # --- Conciliação Inversa (Operadora -> ERP) ---
+            # Realizar o Merge (Left Join: Operadora -> ERP)
+            df_merged_op = pd.merge(
+                df_op,
+                df_erp[match_cols + ['match_id']], 
+                on=match_cols + ['match_id'],
+                how='left',
+                indicator=True
+            )
+
+            df_merged_op['status_conciliacao'] = df_merged_op['_merge'].map({
+                'both': 'CONCILIADO',
+                'left_only': 'DIVERGENTE'
+            })
+            df_merged_op = df_merged_op.drop(columns=['match_id', '_merge'])
+
+            # Métricas Operadora
+            total_vendas_op = len(df_merged_op)
+            total_conciliado_op = len(df_merged_op[df_merged_op['status_conciliacao'] == 'CONCILIADO'])
+            total_divergente_op = len(df_merged_op[df_merged_op['status_conciliacao'] == 'DIVERGENTE'])
+
+            # Exibir Métricas (ERP)
+            st.markdown("### Métricas ERP")
             col_met1, col_met2, col_met3 = st.columns(3)
             col_met1.metric("Total de Vendas (ERP)", total_vendas)
-            col_met2.metric("Conciliadas", total_conciliado)
-            col_met3.metric("Divergentes", total_divergente)
+            col_met2.metric("Conciliadas (ERP)", total_conciliado)
+            col_met3.metric("Divergentes (ERP)", total_divergente)
+            
+            # Exibir Métricas (Operadora)
+            st.markdown("### Métricas Operadora")
+            col_met_op1, col_met_op2, col_met_op3 = st.columns(3)
+            col_met_op1.metric("Total de Vendas (Operadora)", total_vendas_op)
+            col_met_op2.metric("Conciliadas (Operadora)", total_conciliado_op)
+            col_met_op3.metric("Divergentes (Operadora)", total_divergente_op)
 
             st.divider()
             st.header("📈 Resultados Gerais")
@@ -439,21 +499,32 @@ if file_erp and file_operadora:
             df_op_calc['valor_venda_num'] = df_op_calc['valor_venda'].apply(clean_currency)
 
             # Agrupamento
-            erp_summary = df_erp_calc.groupby('operadora')['valor_venda_num'].sum().reset_index()
-            op_summary = df_op_calc.groupby('operadora')['valor_venda_num'].sum().reset_index()
+            erp_summary = df_erp_calc.groupby('operadora').agg(
+                valor_venda_num=('valor_venda_num', 'sum'),
+                qtd_vendas_erp=('operadora', 'count')
+            ).reset_index()
+            
+            op_summary = df_op_calc.groupby('operadora').agg(
+                valor_venda_num=('valor_venda_num', 'sum'),
+                qtd_vendas_op=('operadora', 'count')
+            ).reset_index()
 
             # Merge dos resumos
             summary_merged = pd.merge(erp_summary, op_summary, on='operadora', how='outer', suffixes=('_erp', '_op')).fillna(0)
 
             # Cálculo da Divergência
             summary_merged['divergencia'] = summary_merged['valor_venda_num_erp'] - summary_merged['valor_venda_num_op']
+            summary_merged['divergencia_qtd'] = summary_merged['qtd_vendas_erp'] - summary_merged['qtd_vendas_op']
 
             # Renomear e Formatar para Exibição
             summary_display = summary_merged.rename(columns={
                 'operadora': 'Operadora',
                 'valor_venda_num_erp': 'Valor de venda total no ERP',
                 'valor_venda_num_op': 'Valor de venda total na Operadora',
-                'divergencia': 'Divergência de valor'
+                'divergencia': 'Divergência de valor',
+                'qtd_vendas_erp': 'Quantidade de vendas no ERP',
+                'qtd_vendas_op': 'Quantidade de vendas na Operadora',
+                'divergencia_qtd': 'Divergência de vendas'
             })
 
             # Aplicar formatação de moeda para exibição
@@ -462,71 +533,119 @@ if file_erp and file_operadora:
             summary_display['Valor de venda total no ERP'] = summary_display['Valor de venda total no ERP'].apply(fmt_currency)
             summary_display['Valor de venda total na Operadora'] = summary_display['Valor de venda total na Operadora'].apply(fmt_currency)
             summary_display['Divergência de valor'] = summary_display['Divergência de valor'].apply(fmt_currency)
+            
+            # Formatar quantidades como inteiros
+            summary_display['Quantidade de vendas no ERP'] = summary_display['Quantidade de vendas no ERP'].astype(int)
+            summary_display['Quantidade de vendas na Operadora'] = summary_display['Quantidade de vendas na Operadora'].astype(int)
+            summary_display['Divergência de vendas'] = summary_display['Divergência de vendas'].astype(int)
 
-            st.dataframe(summary_display, width='stretch')
+            # Reordenar colunas
+            cols_order = [
+                'Operadora',
+                'Valor de venda total no ERP',
+                'Valor de venda total na Operadora',
+                'Divergência de valor',
+                'Quantidade de vendas no ERP',
+                'Quantidade de vendas na Operadora',
+                'Divergência de vendas'
+            ]
+            summary_display = summary_display[cols_order]
+
+            # Filtros Dinâmicos (Resultado por adquirente - No período)
+            with st.expander("Filtros Avançados (Resultado por adquirente - No período)", expanded=False):
+                st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
+                
+                summary_filtered = summary_display.copy()
+                
+                # Criar colunas para os filtros (layout em grade)
+                filter_cols_summary = st.columns(3)
+                
+                # Iterar sobre as colunas para criar filtros
+                for i, col in enumerate(summary_display.columns):
+                    unique_vals_summary = sorted(summary_display[col].astype(str).unique())
+                    
+                    with filter_cols_summary[i % 3]:
+                        selected_vals_summary = st.multiselect(f"{col}", unique_vals_summary, key=f"filter_summary_{col}")
+                        
+                        if selected_vals_summary:
+                            summary_filtered = summary_filtered[summary_filtered[col].astype(str).isin(selected_vals_summary)]
+
+            st.dataframe(summary_filtered, width='stretch')
 
             st.divider()
             st.markdown("#### Resultado por adquirente - Diário")
 
             # --- Cálculo do Resumo Diário por Operadora ---
             # Agrupamento por Data e Operadora
-            erp_daily = df_erp_calc.groupby(['data_venda', 'operadora'])['valor_venda_num'].sum().reset_index()
-            op_daily = df_op_calc.groupby(['data_venda', 'operadora'])['valor_venda_num'].sum().reset_index()
+            erp_daily = df_erp_calc.groupby(['data_venda', 'operadora']).agg(
+                valor_venda_num=('valor_venda_num', 'sum'),
+                qtd_vendas_erp=('operadora', 'count')
+            ).reset_index()
+            
+            op_daily = df_op_calc.groupby(['data_venda', 'operadora']).agg(
+                valor_venda_num=('valor_venda_num', 'sum'),
+                qtd_vendas_op=('operadora', 'count')
+            ).reset_index()
 
             # Merge dos resumos diários
             daily_merged = pd.merge(erp_daily, op_daily, on=['data_venda', 'operadora'], how='outer', suffixes=('_erp', '_op')).fillna(0)
 
             # Cálculo da Divergência
             daily_merged['divergencia'] = daily_merged['valor_venda_num_erp'] - daily_merged['valor_venda_num_op']
-
-            # Filtros para o Resumo Diário
-            col_filter1, col_filter2 = st.columns(2)
-            
-            # Obter valores únicos para os filtros
-            unique_dates = sorted(daily_merged['data_venda'].astype(str).unique())
-            unique_ops_daily = sorted(daily_merged['operadora'].astype(str).unique())
-
-            with col_filter1:
-                selected_dates = st.multiselect("Filtrar por Data:", unique_dates, default=unique_dates)
-            with col_filter2:
-                selected_ops = st.multiselect("Filtrar por Operadora:", unique_ops_daily, default=unique_ops_daily)
-
-            # Aplicar Filtros
-            daily_filtered = daily_merged.copy()
-            
-            # Converter data para string para filtrar corretamente com o multiselect
-            daily_filtered['data_venda_str'] = daily_filtered['data_venda'].astype(str)
-            
-            if selected_dates:
-                daily_filtered = daily_filtered[daily_filtered['data_venda_str'].isin(selected_dates)]
-            if selected_ops:
-                daily_filtered = daily_filtered[daily_filtered['operadora'].isin(selected_ops)]
+            daily_merged['divergencia_qtd'] = daily_merged['qtd_vendas_erp'] - daily_merged['qtd_vendas_op']
 
             # Renomear e Formatar para Exibição
-            daily_display = daily_filtered.rename(columns={
+            daily_display = daily_merged.rename(columns={
                 'data_venda': 'Data',
                 'operadora': 'Operadora',
                 'valor_venda_num_erp': 'Valor de venda total no ERP',
                 'valor_venda_num_op': 'Valor de venda total na Operadora',
-                'divergencia': 'Divergência de valor'
+                'divergencia': 'Divergência de valor',
+                'qtd_vendas_erp': 'Quantidade de vendas no ERP',
+                'qtd_vendas_op': 'Quantidade de vendas na Operadora',
+                'divergencia_qtd': 'Divergência de vendas'
             })
 
             # Selecionar colunas finais
-            cols_to_show = ['Data', 'Operadora', 'Valor de venda total no ERP', 'Valor de venda total na Operadora', 'Divergência de valor']
+            cols_to_show = ['Data', 'Operadora', 'Valor de venda total no ERP', 'Valor de venda total na Operadora', 'Divergência de valor', 'Quantidade de vendas no ERP', 'Quantidade de vendas na Operadora', 'Divergência de vendas']
             daily_display = daily_display[cols_to_show]
 
             # Aplicar formatação de moeda
             daily_display['Valor de venda total no ERP'] = daily_display['Valor de venda total no ERP'].apply(fmt_currency)
             daily_display['Valor de venda total na Operadora'] = daily_display['Valor de venda total na Operadora'].apply(fmt_currency)
             daily_display['Divergência de valor'] = daily_display['Divergência de valor'].apply(fmt_currency)
+            
+            # Formatar quantidades como inteiros
+            daily_display['Quantidade de vendas no ERP'] = daily_display['Quantidade de vendas no ERP'].astype(int)
+            daily_display['Quantidade de vendas na Operadora'] = daily_display['Quantidade de vendas na Operadora'].astype(int)
+            daily_display['Divergência de vendas'] = daily_display['Divergência de vendas'].astype(int)
 
-            st.dataframe(daily_display, width='stretch')
+            # Filtros Dinâmicos (Resultado por adquirente - Diário)
+            with st.expander("Filtros Avançados (Resultado por adquirente - Diário)", expanded=False):
+                st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
+                
+                daily_filtered = daily_display.copy()
+                
+                # Criar colunas para os filtros (layout em grade)
+                filter_cols_daily = st.columns(3)
+                
+                # Iterar sobre as colunas para criar filtros
+                for i, col in enumerate(daily_display.columns):
+                    unique_vals_daily = sorted(daily_display[col].astype(str).unique())
+                    
+                    with filter_cols_daily[i % 3]:
+                        selected_vals_daily = st.multiselect(f"{col}", unique_vals_daily, key=f"filter_daily_{col}")
+                        
+                        if selected_vals_daily:
+                            daily_filtered = daily_filtered[daily_filtered[col].astype(str).isin(selected_vals_daily)]
+
+            st.dataframe(daily_filtered, width='stretch')
 
             st.divider()
             st.subheader("🔍 Detalhamento - ERP -> Operadora")
             
-            # Filtros Dinâmicos
-            with st.expander("Filtros Avançados", expanded=False):
+            # Filtros Dinâmicos (ERP -> Operadora)
+            with st.expander("Filtros Avançados (ERP -> Operadora)", expanded=False):
                 st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
                 
                 df_filtered = df_merged.copy()
@@ -536,11 +655,10 @@ if file_erp and file_operadora:
                 
                 # Iterar sobre as colunas para criar filtros
                 for i, col in enumerate(df_merged.columns):
-                    # Pular colunas que não fazem sentido filtrar ou são muito grandes/únicas (opcional, mas aqui vamos deixar todas)
                     unique_vals = sorted(df_merged[col].astype(str).unique())
                     
                     with filter_cols[i % 3]:
-                        selected_vals = st.multiselect(f"{col}", unique_vals, key=f"filter_{col}")
+                        selected_vals = st.multiselect(f"{col}", unique_vals, key=f"filter_erp_{col}")
                         
                         if selected_vals:
                             df_filtered = df_filtered[df_filtered[col].astype(str).isin(selected_vals)]
@@ -548,6 +666,39 @@ if file_erp and file_operadora:
             st.dataframe(df_filtered, width='stretch')
 
             st.divider()
+            st.subheader("🔍 Detalhamento - Operadora -> ERP")
+            
+            # Filtros Dinâmicos (Operadora -> ERP)
+            with st.expander("Filtros Avançados (Operadora -> ERP)", expanded=False):
+                st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
+                
+                df_filtered_op = df_merged_op.copy()
+                
+                # Criar colunas para os filtros (layout em grade)
+                filter_cols_op = st.columns(3)
+                
+                # Iterar sobre as colunas para criar filtros
+                for i, col in enumerate(df_merged_op.columns):
+                    unique_vals_op = sorted(df_merged_op[col].astype(str).unique())
+                    
+                    with filter_cols_op[i % 3]:
+                        selected_vals_op = st.multiselect(f"{col}", unique_vals_op, key=f"filter_op_{col}")
+                        
+                        if selected_vals_op:
+                            df_filtered_op = df_filtered_op[df_filtered_op[col].astype(str).isin(selected_vals_op)]
+            
+            st.dataframe(df_filtered_op, width='stretch')
+
+            st.divider()
+            
+            # Exibir Débitos Separados (se houver)
+            if 'df_debits' in st.session_state and st.session_state.df_debits is not None and not st.session_state.df_debits.empty:
+                with st.expander("💸 Débitos Separados (- R$)", expanded=False):
+                    st.info("Registros com valores negativos que foram separados da conciliação principal.")
+                    st.dataframe(st.session_state.df_debits, width='stretch')
+                    st.caption(f"Total de registros: {len(st.session_state.df_debits)}")
+                st.divider()
+
             with st.expander("📂 Visualizar Dados Processados (Detalhes)"):
                 tab_erp, tab_op = st.tabs(["Dados ERP (Processados)", "Dados Operadora (Processados)"])
                 
