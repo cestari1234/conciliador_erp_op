@@ -1,6 +1,12 @@
 import streamlit as st
 import pandas as pd
+import pandas as pd
 from io import BytesIO
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 # --- Configuração da Página ---
 st.set_page_config(
@@ -79,6 +85,182 @@ def get_operator_suggestion(name):
             return value
     return ""
 
+def clean_input_value(val):
+    """Limpa valores de entrada (R$, %, vírgula) e converte para float."""
+    if pd.isna(val) or val == "":
+        return 0.0
+    
+    if isinstance(val, (int, float)):
+        return float(val)
+        
+    val_str = str(val).strip()
+    
+    # Remover símbolos de moeda e porcentagem
+    val_str = val_str.replace('R$', '').replace('%', '').replace(' ', '')
+    
+    # Tratar vírgula como decimal se não houver ponto, ou se houver ponto e vírgula (ex: 1.000,00)
+    if ',' in val_str:
+        if '.' in val_str:
+            # Assumir formato brasileiro 1.000,00 -> remover ponto, trocar vírgula por ponto
+            val_str = val_str.replace('.', '').replace(',', '.')
+        else:
+            # Assumir apenas vírgula decimal 10,00 -> trocar vírgula por ponto
+            val_str = val_str.replace(',', '.')
+            
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+def generate_word_report(erp_metrics, op_metrics, summary_df, daily_df, start_date, end_date, erp_divergences, op_divergences):
+    """Gera um relatório executivo em Word (.docx)."""
+    doc = Document()
+    
+    # --- Estilos ---
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
+    
+    # Título
+    heading = doc.add_heading('Relatório Executivo de Conciliação', 0)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Período
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(f"Período: {start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')}")
+    run.italic = True
+    run.font.color.rgb = RGBColor(100, 100, 100)
+    
+    doc.add_paragraph() # Espaço
+    
+    # --- 1. Resumo Executivo ---
+    doc.add_heading('1. Resumo Executivo', level=1)
+    
+    # Tabela de KPIs
+    table = doc.add_table(rows=1, cols=3)
+    table.style = 'Table Grid'
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = 'Métrica'
+    hdr_cells[1].text = 'ERP'
+    hdr_cells[2].text = 'Operadora'
+    
+    # Preencher KPIs
+    metrics = [
+        ("Vendas Brutas", erp_metrics['vendas_brutas'], op_metrics['vendas_brutas']),
+        ("Taxa Média", f"{erp_metrics['taxa_media']:.2f}%", f"{op_metrics['taxa_media']:.2f}%"),
+        ("Total de Taxas", erp_metrics['total_taxas'], op_metrics['total_taxas']),
+        ("Vendas Líquidas", erp_metrics['vendas_liquidas'], op_metrics['vendas_liquidas'])
+    ]
+    
+    for metric, val_erp, val_op in metrics:
+        row_cells = table.add_row().cells
+        row_cells[0].text = metric
+        row_cells[1].text = val_erp if isinstance(val_erp, str) else f"R$ {val_erp:,.2f}"
+        row_cells[2].text = val_op if isinstance(val_op, str) else f"R$ {val_op:,.2f}"
+        
+    doc.add_paragraph()
+    
+    # --- 2. Detalhamento Financeiro ---
+    doc.add_heading('2. Detalhamento Financeiro', level=1)
+    doc.add_paragraph("Abaixo o comparativo detalhado entre os valores registrados no ERP e na Operadora.")
+    
+    # Usar o DataFrame de resumo já calculado
+    # Converter para lista de listas para tabela do Word
+    
+    # --- 3. Performance por Adquirente ---
+    doc.add_heading('3. Performance por Adquirente', level=1)
+    
+    if not summary_df.empty:
+        # Adicionar Tabela
+        table_perf = doc.add_table(rows=1, cols=len(summary_df.columns))
+        table_perf.style = 'Light Shading Accent 1'
+        
+        # Cabeçalho
+        for i, col_name in enumerate(summary_df.columns):
+            table_perf.rows[0].cells[i].text = str(col_name)
+            
+        # Linhas
+        for index, row in summary_df.iterrows():
+            row_cells = table_perf.add_row().cells
+            for i, item in enumerate(row):
+                row_cells[i].text = str(item)
+    else:
+        doc.add_paragraph("Nenhum dado disponível para este período.")
+
+    # --- 4. Detalhamento - ERP -> Operadora (Divergentes) ---
+    doc.add_heading('4. Detalhamento - ERP -> Operadora (Divergentes)', level=1)
+    doc.add_paragraph("Registros do ERP que não foram encontrados na Operadora.")
+
+    if not erp_divergences.empty:
+        # Limitar colunas para caber na página (opcional, mas recomendado)
+        # Vamos pegar as colunas principais
+        cols_to_export = ['data_venda', 'valor_venda', 'operadora', 'nsu']
+        # Verificar se existem
+        cols_to_export = [c for c in cols_to_export if c in erp_divergences.columns]
+        
+        table_div_erp = doc.add_table(rows=1, cols=len(cols_to_export))
+        table_div_erp.style = 'Table Grid'
+        
+        # Cabeçalho
+        for i, col_name in enumerate(cols_to_export):
+            table_div_erp.rows[0].cells[i].text = str(col_name)
+            
+        # Linhas (Limitar a 100 para não quebrar o Word se for muito grande, ou avisar)
+        # O usuário pediu tabelas separadas, vamos colocar tudo mas com cuidado
+        # Se for muito grande, o Word pode ficar lento. Vamos limitar a 500 linhas por segurança.
+        max_rows = 500
+        for index, row in erp_divergences.head(max_rows).iterrows():
+            row_cells = table_div_erp.add_row().cells
+            for i, col in enumerate(cols_to_export):
+                row_cells[i].text = str(row[col])
+        
+        if len(erp_divergences) > max_rows:
+            doc.add_paragraph(f"... e mais {len(erp_divergences) - max_rows} registros. (Exibição limitada a {max_rows} itens)")
+    else:
+        doc.add_paragraph("Nenhuma divergência encontrada nesta direção.")
+
+    # --- 5. Detalhamento - Operadora -> ERP (Divergentes) ---
+    doc.add_heading('5. Detalhamento - Operadora -> ERP (Divergentes)', level=1)
+    doc.add_paragraph("Registros da Operadora que não foram encontrados no ERP.")
+
+    if not op_divergences.empty:
+        cols_to_export = ['data_venda', 'valor_venda', 'operadora', 'nsu']
+        cols_to_export = [c for c in cols_to_export if c in op_divergences.columns]
+        
+        table_div_op = doc.add_table(rows=1, cols=len(cols_to_export))
+        table_div_op.style = 'Table Grid'
+        
+        # Cabeçalho
+        for i, col_name in enumerate(cols_to_export):
+            table_div_op.rows[0].cells[i].text = str(col_name)
+            
+        # Linhas
+        max_rows = 500
+        for index, row in op_divergences.head(max_rows).iterrows():
+            row_cells = table_div_op.add_row().cells
+            for i, col in enumerate(cols_to_export):
+                row_cells[i].text = str(row[col])
+                
+        if len(op_divergences) > max_rows:
+            doc.add_paragraph(f"... e mais {len(op_divergences) - max_rows} registros. (Exibição limitada a {max_rows} itens)")
+    else:
+        doc.add_paragraph("Nenhuma divergência encontrada nesta direção.")
+
+    # Rodapé
+    section = doc.sections[0]
+    footer = section.footer
+    p_foot = footer.paragraphs[0]
+    p_foot.text = "Gerado automaticamente pelo sistema Concicard"
+    p_foot.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+    # Salvar em memória
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
 # --- Interface Principal ---
 
 st.title("📊 Conciliador de Vendas")
@@ -126,21 +308,42 @@ if file_erp and file_operadora:
             st.header("🛠️ Mapeamento de Colunas")
             
             # Colunas Padrão Requeridas (ERP)
+            # Colunas Padrão Requeridas (ERP)
             required_columns_erp = {
                 "data_venda": "Data da Venda",
                 "valor_venda": "Valor da Venda",
                 "operadora": "Operadora",
                 "nsu": "NSU",
-                "parcelas": "Parcelas"
+                "parcelas": "Parcelas",
+                "taxa": "Taxa (%)",
+                "valor_liquido": "Valor Líquido",
+                "valor_taxa": "Valor da Taxa"
             }
+
+            # Ajuste dinâmico para Brajan
+            if erp_name == "Brajan":
+                if "taxa" in required_columns_erp:
+                    del required_columns_erp["taxa"]
+                if "valor_liquido" in required_columns_erp:
+                    del required_columns_erp["valor_liquido"]
 
             # Colunas Padrão Requeridas (Operadora) - Sem Parcelas
             required_columns_op = {
                 "data_venda": "Data da Venda",
                 "valor_venda": "Valor da Venda",
                 "operadora": "Operadora",
-                "nsu": "NSU"
+                "nsu": "NSU",
+                "taxa": "Taxa (%)",
+                "valor_liquido": "Valor Líquido",
+                "valor_pago": "Valor Pago",
+                "taxa_pagamento": "Taxa Pagamento (%)",
+                "valor_taxa": "Valor da Taxa"
             }
+
+            # Ajuste dinâmico para Sistema Conciliadora
+            if operadora_source == "Sistema Conciliadora":
+                if "valor_pago" in required_columns_op:
+                    del required_columns_op["valor_pago"]
 
             # Mapeamentos Automáticos (Padrão)
             ERP_MAPPINGS = {
@@ -149,7 +352,10 @@ if file_erp and file_operadora:
                     "valor_venda": "Vr. Venda",
                     "operadora": "Bandeira",
                     "nsu": "Autorização",
-                    "parcelas": "Pc"
+                    "parcelas": "Pc",
+                    "taxa": "Taxa",
+                    "valor_liquido": "Liquido",
+                    "valor_taxa": "Taxa"
                 }
             }
 
@@ -158,7 +364,11 @@ if file_erp and file_operadora:
                     "data_venda": "Venda",
                     "valor_venda": "Bruto",
                     "operadora": "Produto",
-                    "nsu": "NSU"
+                    "nsu": "NSU",
+                    "taxa": "Taxa",
+                    "valor_liquido": "Liquido",
+                    "taxa_pagamento": "Taxa",
+                    "valor_taxa": "Valor Taxa"
                 }
             }
 
@@ -293,14 +503,33 @@ if file_erp and file_operadora:
                     # 3. Operadora: Unificar por NSU (Somar Valor)
                     df_op_std['valor_venda'] = pd.to_numeric(df_op_std['valor_venda'], errors='coerce').fillna(0)
                     
+                    # Converter novas colunas para numérico se existirem (Operadora)
+                    for col in ['taxa', 'valor_liquido', 'valor_pago', 'taxa_pagamento', 'valor_taxa']:
+                        if col in df_op_std.columns:
+                            df_op_std[col] = df_op_std[col].apply(clean_input_value)
+
+                    # Converter novas colunas para numérico se existirem (ERP)
+                    for col in ['taxa', 'valor_liquido', 'valor_taxa']:
+                        if col in df_erp_std.columns:
+                            df_erp_std[col] = df_erp_std[col].apply(clean_input_value)
+                    
                     if check_op_agg:
                         if 'nsu' in df_op_std.columns:
-                            # Agrupar por NSU, Data e Operadora para evitar unificações incorretas
-                            # Ex: Mesmo NSU em dias diferentes ou operadoras diferentes
-                            df_op_std = df_op_std.groupby(['nsu', 'data_venda', 'operadora'], as_index=False).agg({
+                            # Definir dicionário de agregação
+                            agg_dict = {
                                 'valor_venda': 'sum',
                                 'origem': 'first'
-                            })
+                            }
+                            # Adicionar novas colunas ao dicionário de agregação se existirem
+                            for col in ['taxa', 'valor_liquido', 'valor_pago', 'taxa_pagamento', 'valor_taxa']:
+                                if col in df_op_std.columns:
+                                    if 'taxa' in col and col != 'valor_taxa':
+                                        agg_dict[col] = 'mean' # Média para taxas
+                                    else:
+                                        agg_dict[col] = 'sum' # Soma para valores
+                            
+                            # Agrupar por NSU, Data e Operadora
+                            df_op_std = df_op_std.groupby(['nsu', 'data_venda', 'operadora'], as_index=False).agg(agg_dict)
 
                     # Filtragem por Data
                     start_date = pd.to_datetime(start_date)
@@ -331,10 +560,20 @@ if file_erp and file_operadora:
                         
                         df_erp_final['valor_venda'] = df_erp_final['valor_venda'].apply(format_currency)
                         df_op_final['valor_venda'] = df_op_final['valor_venda'].apply(format_currency)
+                        
+                        # Formatar também valor_taxa se existir
+                        if 'valor_taxa' in df_erp_final.columns:
+                            df_erp_final['valor_taxa'] = pd.to_numeric(df_erp_final['valor_taxa'], errors='coerce').fillna(0)
+                            df_erp_final['valor_taxa'] = df_erp_final['valor_taxa'].apply(format_currency)
+                        if 'valor_taxa' in df_op_final.columns:
+                            df_op_final['valor_taxa'] = pd.to_numeric(df_op_final['valor_taxa'], errors='coerce').fillna(0)
+                            df_op_final['valor_taxa'] = df_op_final['valor_taxa'].apply(format_currency)
 
                     # Salvar no Session State e avançar
                     st.session_state.df_erp_processed = df_erp_final
                     st.session_state.df_op_processed = df_op_final
+                    st.session_state.start_date = start_date
+                    st.session_state.end_date = end_date
                     
                     # Lógica de Pulo do De-Para
                     if check_depara:
@@ -372,24 +611,47 @@ if file_erp and file_operadora:
                 mapping_changes = {}
                 
                 # Distribuir inputs em duas colunas
+                # Distribuir inputs em duas colunas
                 for i, op_name in enumerate(all_unique_ops):
                     col = col_depara1 if i % 2 == 0 else col_depara2
                     
                     # Obter sugestão automática
                     suggestion = get_operator_suggestion(op_name)
                     
-                    new_val = col.text_input(f"De: '{op_name}' Para:", value=suggestion, key=f"depara_{i}")
-                    if new_val.strip():
+                    # Criar colunas para checkbox e input
+                    c1, c2 = col.columns([0.15, 0.85])
+                    
+                    # Checkbox para incluir/excluir
+                    include_op = c1.checkbox("Incluir", value=True, key=f"check_{i}", label_visibility="collapsed")
+                    
+                    if not include_op:
+                        mapping_changes[op_name] = "__REMOVE__"
+                    
+                    # Input para renomear
+                    new_val = c2.text_input(f"De: '{op_name}' Para:", value=suggestion, key=f"depara_{i}")
+                    
+                    if include_op and new_val.strip():
                         mapping_changes[op_name] = new_val.strip()
 
                 submitted = st.form_submit_button("✅ Finalizar e Visualizar Resultados")
                 
                 if submitted:
-                    # Aplicar mudanças
-                    if mapping_changes:
-                        df_erp_final['operadora'] = df_erp_final['operadora'].astype(str).replace(mapping_changes)
-                        df_op_final['operadora'] = df_op_final['operadora'].astype(str).replace(mapping_changes)
-                        st.success(f"{len(mapping_changes)} padronizações aplicadas!")
+                    # Identificar operadoras a remover
+                    ops_to_remove = [k for k, v in mapping_changes.items() if v == "__REMOVE__"]
+                    
+                    # Filtrar DataFrames
+                    if ops_to_remove:
+                        df_erp_final = df_erp_final[~df_erp_final['operadora'].astype(str).isin(ops_to_remove)]
+                        df_op_final = df_op_final[~df_op_final['operadora'].astype(str).isin(ops_to_remove)]
+                        st.warning(f"{len(ops_to_remove)} operadoras foram removidas da análise.")
+
+                    # Aplicar mudanças de nome (apenas para os que não foram removidos)
+                    rename_map = {k: v for k, v in mapping_changes.items() if v != "__REMOVE__"}
+                    
+                    if rename_map:
+                        df_erp_final['operadora'] = df_erp_final['operadora'].astype(str).replace(rename_map)
+                        df_op_final['operadora'] = df_op_final['operadora'].astype(str).replace(rename_map)
+                        st.success(f"{len(rename_map)} padronizações aplicadas!")
                     
                     # Atualizar Session State
                     st.session_state.df_erp_processed = df_erp_final
@@ -477,6 +739,127 @@ if file_erp and file_operadora:
             col_met_op3.metric("Divergentes (Operadora)", total_divergente_op)
 
             st.divider()
+            st.subheader("📊 Resumo dos Resultados")
+            
+            # --- Cálculo de Métricas Financeiras ---
+            
+
+            
+            # --- PREPARAÇÃO DOS DADOS (OPERADORA) ---
+            df_op_metrics = df_op.copy()
+            metric_cols_op = ['valor_venda', 'taxa', 'valor_liquido', 'valor_taxa']
+            
+            for col in metric_cols_op:
+                if col in df_op_metrics.columns:
+                     df_op_metrics[col] = df_op_metrics[col].apply(clean_input_value)
+                else:
+                    df_op_metrics[col] = 0.0
+
+            # --- PREPARAÇÃO DOS DADOS (ERP) ---
+            df_erp_metrics = df_erp.copy()
+            metric_cols_erp = ['valor_venda', 'taxa', 'valor_liquido', 'valor_taxa']
+
+            for col in metric_cols_erp:
+                if col in df_erp_metrics.columns:
+                     df_erp_metrics[col] = df_erp_metrics[col].apply(clean_input_value)
+                else:
+                    df_erp_metrics[col] = 0.0
+
+            # --- CÁLCULO DE MÉTRICAS (OPERADORA) ---
+            # 1. Valor total de vendas brutas
+            vendas_brutas_op = df_op_metrics['valor_venda'].sum()
+            
+            # 2. Taxa média aplicada nas vendas
+            # 2. Valor total da taxa aplicada nas vendas
+            if df_op_metrics['valor_taxa'].sum() > 0:
+                valor_total_taxa_op = df_op_metrics['valor_taxa'].sum()
+            elif df_op_metrics['valor_liquido'].sum() > 0:
+                 valor_total_taxa_op = vendas_brutas_op - df_op_metrics['valor_liquido'].sum()
+            else:
+                 valor_total_taxa_op = (df_op_metrics['valor_venda'] * df_op_metrics['taxa'] / 100).sum()
+
+            # 3. Taxa média aplicada nas vendas
+            if vendas_brutas_op > 0:
+                taxa_media_op = (valor_total_taxa_op / vendas_brutas_op) * 100
+            else:
+                taxa_media_op = 0.0
+
+            # Vendas Líquidas
+            if df_op_metrics['valor_liquido'].sum() > 0:
+                 vendas_liquidas_op = df_op_metrics['valor_liquido'].sum()
+            else:
+                 vendas_liquidas_op = vendas_brutas_op - valor_total_taxa_op
+
+            # 4. Débitos em vendas
+            debitos_op_val = 0.0
+            if 'df_debits' in st.session_state and st.session_state.df_debits is not None and not st.session_state.df_debits.empty:
+                 debitos_op_df = st.session_state.df_debits[st.session_state.df_debits['Origem'] == 'Operadora']
+                 if not debitos_op_df.empty:
+                     debitos_op_val = pd.to_numeric(debitos_op_df['valor_venda'], errors='coerce').sum()
+
+            # --- CÁLCULO DE MÉTRICAS (ERP) ---
+            # 1. Valor total de vendas brutas
+            vendas_brutas_erp = df_erp_metrics['valor_venda'].sum()
+            
+            # 2. Taxa média aplicada nas vendas
+            # 2. Valor total da taxa aplicada nas vendas
+            if df_erp_metrics['valor_taxa'].sum() > 0:
+                valor_total_taxa_erp = df_erp_metrics['valor_taxa'].sum()
+            elif df_erp_metrics['valor_liquido'].sum() > 0:
+                 valor_total_taxa_erp = vendas_brutas_erp - df_erp_metrics['valor_liquido'].sum()
+            else:
+                 valor_total_taxa_erp = (df_erp_metrics['valor_venda'] * df_erp_metrics['taxa'] / 100).sum()
+
+            # 3. Taxa média aplicada nas vendas
+            if vendas_brutas_erp > 0:
+                taxa_media_erp = (valor_total_taxa_erp / vendas_brutas_erp) * 100
+            else:
+                taxa_media_erp = 0.0
+
+            # Vendas Líquidas
+            if df_erp_metrics['valor_liquido'].sum() > 0:
+                 vendas_liquidas_erp = df_erp_metrics['valor_liquido'].sum()
+            else:
+                 vendas_liquidas_erp = vendas_brutas_erp - valor_total_taxa_erp
+
+            # 4. Débitos em vendas
+            debitos_erp_val = 0.0
+            if 'df_debits' in st.session_state and st.session_state.df_debits is not None and not st.session_state.df_debits.empty:
+                 debitos_erp_df = st.session_state.df_debits[st.session_state.df_debits['Origem'] == 'ERP']
+                 if not debitos_erp_df.empty:
+                     debitos_erp_val = pd.to_numeric(debitos_erp_df['valor_venda'], errors='coerce').sum()
+
+            # Exibir Tabela de Resumo Comparativo
+            st.markdown("#### Detalhamento Financeiro")
+            
+            resumo_data = {
+                "Métrica": [
+                    "Valor total de vendas brutas",
+                    "Taxa média aplicada nas vendas",
+                    "Valor total da taxa aplicada nas vendas",
+                    "Débitos em vendas",
+                    "Valor total de vendas líquidas"
+                ],
+                "Valor - ERP": [
+                    f"R$ {vendas_brutas_erp:,.2f}",
+                    f"{taxa_media_erp:.2f}%",
+                    f"R$ {valor_total_taxa_erp:,.2f}",
+                    f"R$ {debitos_erp_val:,.2f}",
+                    f"R$ {vendas_liquidas_erp:,.2f}"
+                ],
+                "Valor - Operadora": [
+                    f"R$ {vendas_brutas_op:,.2f}",
+                    f"{taxa_media_op:.2f}%",
+                    f"R$ {valor_total_taxa_op:,.2f}",
+                    f"R$ {debitos_op_val:,.2f}",
+                    f"R$ {vendas_liquidas_op:,.2f}"
+                ]
+            }
+            
+            df_resumo_financeiro = pd.DataFrame(resumo_data)
+            st.dataframe(df_resumo_financeiro, width='stretch', hide_index=True)
+
+            st.divider()
             st.header("📈 Resultados Gerais")
             
             st.markdown("#### Resultado por adquirente - No período")
@@ -523,8 +906,7 @@ if file_erp and file_operadora:
                 'valor_venda_num_op': 'Valor de venda total na Operadora',
                 'divergencia': 'Divergência de valor',
                 'qtd_vendas_erp': 'Quantidade de vendas no ERP',
-                'qtd_vendas_op': 'Quantidade de vendas na Operadora',
-                'divergencia_qtd': 'Divergência de vendas'
+                'qtd_vendas_op': 'Quantidade de vendas na Operadora'
             })
 
             # Aplicar formatação de moeda para exibição
@@ -537,7 +919,6 @@ if file_erp and file_operadora:
             # Formatar quantidades como inteiros
             summary_display['Quantidade de vendas no ERP'] = summary_display['Quantidade de vendas no ERP'].astype(int)
             summary_display['Quantidade de vendas na Operadora'] = summary_display['Quantidade de vendas na Operadora'].astype(int)
-            summary_display['Divergência de vendas'] = summary_display['Divergência de vendas'].astype(int)
 
             # Reordenar colunas
             cols_order = [
@@ -546,8 +927,7 @@ if file_erp and file_operadora:
                 'Valor de venda total na Operadora',
                 'Divergência de valor',
                 'Quantidade de vendas no ERP',
-                'Quantidade de vendas na Operadora',
-                'Divergência de vendas'
+                'Quantidade de vendas na Operadora'
             ]
             summary_display = summary_display[cols_order]
 
@@ -602,12 +982,11 @@ if file_erp and file_operadora:
                 'valor_venda_num_op': 'Valor de venda total na Operadora',
                 'divergencia': 'Divergência de valor',
                 'qtd_vendas_erp': 'Quantidade de vendas no ERP',
-                'qtd_vendas_op': 'Quantidade de vendas na Operadora',
-                'divergencia_qtd': 'Divergência de vendas'
+                'qtd_vendas_op': 'Quantidade de vendas na Operadora'
             })
 
             # Selecionar colunas finais
-            cols_to_show = ['Data', 'Operadora', 'Valor de venda total no ERP', 'Valor de venda total na Operadora', 'Divergência de valor', 'Quantidade de vendas no ERP', 'Quantidade de vendas na Operadora', 'Divergência de vendas']
+            cols_to_show = ['Data', 'Operadora', 'Valor de venda total no ERP', 'Valor de venda total na Operadora', 'Divergência de valor', 'Quantidade de vendas no ERP', 'Quantidade de vendas na Operadora']
             daily_display = daily_display[cols_to_show]
 
             # Aplicar formatação de moeda
@@ -618,7 +997,6 @@ if file_erp and file_operadora:
             # Formatar quantidades como inteiros
             daily_display['Quantidade de vendas no ERP'] = daily_display['Quantidade de vendas no ERP'].astype(int)
             daily_display['Quantidade de vendas na Operadora'] = daily_display['Quantidade de vendas na Operadora'].astype(int)
-            daily_display['Divergência de vendas'] = daily_display['Divergência de vendas'].astype(int)
 
             # Filtros Dinâmicos (Resultado por adquirente - Diário)
             with st.expander("Filtros Avançados (Resultado por adquirente - Diário)", expanded=False):
@@ -642,9 +1020,9 @@ if file_erp and file_operadora:
             st.dataframe(daily_filtered, width='stretch')
 
             st.divider()
-            st.subheader("🔍 Detalhamento - ERP -> Operadora")
+            st.header("🔍 Detalhamento - ERP -> Operadora")
             
-            # Filtros Dinâmicos (ERP -> Operadora)
+            # --- Filtros Dinâmicos (Detalhamento ERP -> Operadora) ---
             with st.expander("Filtros Avançados (ERP -> Operadora)", expanded=False):
                 st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
                 
@@ -655,6 +1033,9 @@ if file_erp and file_operadora:
                 
                 # Iterar sobre as colunas para criar filtros
                 for i, col in enumerate(df_merged.columns):
+                    # Pular colunas que não fazem sentido filtrar ou são muito únicas (opcional)
+                    if col == 'match_id': continue
+                    
                     unique_vals = sorted(df_merged[col].astype(str).unique())
                     
                     with filter_cols[i % 3]:
@@ -662,13 +1043,13 @@ if file_erp and file_operadora:
                         
                         if selected_vals:
                             df_filtered = df_filtered[df_filtered[col].astype(str).isin(selected_vals)]
-            
+
             st.dataframe(df_filtered, width='stretch')
 
             st.divider()
-            st.subheader("🔍 Detalhamento - Operadora -> ERP")
+            st.header("🔍 Detalhamento - Operadora -> ERP")
             
-            # Filtros Dinâmicos (Operadora -> ERP)
+            # --- Filtros Dinâmicos (Detalhamento Operadora -> ERP) ---
             with st.expander("Filtros Avançados (Operadora -> ERP)", expanded=False):
                 st.info("Selecione os valores para filtrar a tabela abaixo. Deixe em branco para ver tudo.")
                 
@@ -679,6 +1060,9 @@ if file_erp and file_operadora:
                 
                 # Iterar sobre as colunas para criar filtros
                 for i, col in enumerate(df_merged_op.columns):
+                    # Pular colunas que não fazem sentido filtrar ou são muito únicas (opcional)
+                    if col == 'match_id': continue
+                    
                     unique_vals_op = sorted(df_merged_op[col].astype(str).unique())
                     
                     with filter_cols_op[i % 3]:
@@ -686,38 +1070,60 @@ if file_erp and file_operadora:
                         
                         if selected_vals_op:
                             df_filtered_op = df_filtered_op[df_filtered_op[col].astype(str).isin(selected_vals_op)]
-            
+
             st.dataframe(df_filtered_op, width='stretch')
 
-            st.divider()
-            
-            # Exibir Débitos Separados (se houver)
+            # Exibir Débitos Separados se houver
             if 'df_debits' in st.session_state and st.session_state.df_debits is not None and not st.session_state.df_debits.empty:
-                with st.expander("💸 Débitos Separados (- R$)", expanded=False):
-                    st.info("Registros com valores negativos que foram separados da conciliação principal.")
-                    st.dataframe(st.session_state.df_debits, width='stretch')
-                    st.caption(f"Total de registros: {len(st.session_state.df_debits)}")
                 st.divider()
+                with st.expander("💸 Débitos Separados (- R$)", expanded=False):
+                    st.warning("Estes valores foram separados do processamento principal por serem negativos.")
+                    st.dataframe(st.session_state.df_debits, width='stretch')
 
-            with st.expander("📂 Visualizar Dados Processados (Detalhes)"):
-                tab_erp, tab_op = st.tabs(["Dados ERP (Processados)", "Dados Operadora (Processados)"])
+            # Botão para Reiniciar
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button("🔄 Reiniciar Processo"):
+                    st.session_state.step = 0
+                    st.session_state.df_erp_processed = None
+                    st.session_state.df_op_processed = None
+                    st.session_state.df_debits = None
+                    st.rerun()
+            
+            with col_btn2:
+                # Preparar dados para o relatório
+                erp_metrics_dict = {
+                    'vendas_brutas': vendas_brutas_erp,
+                    'taxa_media': taxa_media_erp,
+                    'total_taxas': valor_total_taxa_erp,
+                    'vendas_liquidas': vendas_liquidas_erp
+                }
+                op_metrics_dict = {
+                    'vendas_brutas': vendas_brutas_op,
+                    'taxa_media': taxa_media_op,
+                    'total_taxas': valor_total_taxa_op,
+                    'vendas_liquidas': vendas_liquidas_op
+                }
                 
-                with tab_erp:
-                    st.dataframe(df_erp, width='stretch')
-                    st.caption(f"Total de registros: {len(df_erp)}")
+                # Filtrar Divergências
+                df_erp_div = df_merged[df_merged['status_conciliacao'] == 'DIVERGENTE'].copy()
+                df_op_div = df_merged_op[df_merged_op['status_conciliacao'] == 'DIVERGENTE'].copy()
+
+                # Gerar Relatório
+                report_buffer = generate_word_report(
+                    erp_metrics_dict, 
+                    op_metrics_dict, 
+                    summary_display, 
+                    daily_display, 
+                    st.session_state.start_date, 
+                    st.session_state.end_date,
+                    df_erp_div,
+                    df_op_div
+                )
                 
-                with tab_op:
-                    st.dataframe(df_op, width='stretch')
-                    st.caption(f"Total de registros: {len(df_op)}")
-
-            if st.button("🔄 Reiniciar Processo"):
-                st.session_state.step = 0
-                st.session_state.df_erp_processed = None
-                st.session_state.df_op_processed = None
-                st.rerun()
-
-    else:
-        st.warning("Por favor, faça o upload de arquivos válidos.")
-
-else:
-    st.info("👆 Aguardando upload dos arquivos para exibir opções de mapeamento.")
+                st.download_button(
+                    label="📄 Gerar Relatório (.docx)",
+                    data=report_buffer,
+                    file_name="relatorio_conciliacao.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
