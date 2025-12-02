@@ -649,8 +649,8 @@ if file_erp and file_operadora:
                     rename_map = {k: v for k, v in mapping_changes.items() if v != "__REMOVE__"}
                     
                     if rename_map:
-                        df_erp_final['operadora'] = df_erp_final['operadora'].astype(str).replace(rename_map)
-                        df_op_final['operadora'] = df_op_final['operadora'].astype(str).replace(rename_map)
+                        df_erp_final.loc[:, 'operadora'] = df_erp_final['operadora'].astype(str).replace(rename_map)
+                        df_op_final.loc[:, 'operadora'] = df_op_final['operadora'].astype(str).replace(rename_map)
                         st.success(f"{len(rename_map)} padronizações aplicadas!")
                     
                     # Atualizar Session State
